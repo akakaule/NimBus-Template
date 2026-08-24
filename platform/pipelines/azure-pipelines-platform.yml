@@ -1,0 +1,140 @@
+# Publishes the Acme platform catalog to a private Azure Artifacts feed.
+#
+# The package this produces is the entire interface between this repository and any
+# deployment: `nb setup --platform-package Acme.Platform@<version>` resolves it
+# from the feed, provisions the Service Bus topology from the catalog inside it, and ships the
+# assembly with the management WebApp. No deployment ever clones or builds this repo.
+#
+# Every push to main runs the full job; only main publishes. Pull request validation is
+# configured through a branch policy (Azure Repos ignores a `pr:` trigger block in YAML), and
+# the publish step below is gated on the branch, so a PR build validates the catalog without
+# putting a version on the feed.
+trigger:
+  branches:
+    include:
+      - main
+
+parameters:
+  # REPLACE both URLs with your feed. Copy them from Artifacts → your feed → Connect to feed →
+  # dotnet; that dialog shows the index URL, and feedBaseUrl is the same string with
+  # /v3/index.json removed.
+  #
+  # A project-scoped feed's URL carries a project segment, as below. An organisation-scoped
+  # feed has none (https://pkgs.dev.azure.com/<org>/_packaging/<feed>/nuget/...). Getting this
+  # wrong fails with "the feed with ID '<feed>' doesn't exist", which reads like a missing
+  # feed rather than a URL addressing the wrong scope. Prefer the project's **id** over its
+  # name in that segment: the id needs no percent-encoding if the project name has spaces, and
+  # it survives a rename.
+  - name: feedIndexUrl
+    displayName: "Azure Artifacts feed to publish to (full v3 index URL)"
+    type: string
+    default: https://pkgs.dev.azure.com/acme/00000000-0000-0000-0000-000000000000/_packaging/acme-platform/nuget/v3/index.json
+  # What a consumer passes to `nb --platform-feed`: the CLI appends /v3/index.json itself, so
+  # this is the same feed with that suffix removed. Kept as a parameter purely so the run
+  # summary can print a line that is correct to paste into the deployment pipeline.
+  - name: feedBaseUrl
+    displayName: "Same feed as the CLI consumes it (no /v3/index.json)"
+    type: string
+    default: https://pkgs.dev.azure.com/acme/00000000-0000-0000-0000-000000000000/_packaging/acme-platform/nuget
+  - name: nimbusVersion
+    displayName: "Akaule.NimBus.CommandLine version used to validate the catalog"
+    type: string
+    default: 3.2.0
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  buildConfiguration: Release
+  isMain: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+
+steps:
+  - checkout: self
+
+  - task: UseDotNet@2
+    displayName: Setup .NET 10
+    inputs:
+      packageType: sdk
+      version: 10.0.x
+
+  - script: |
+      set -euo pipefail
+      dotnet build Acme.Platform.slnx -c "$(buildConfiguration)"
+    displayName: Build
+
+  - task: DotNetCoreCLI@2
+    displayName: Test
+    inputs:
+      command: test
+      projects: Acme.Platform.slnx
+      arguments: -c $(buildConfiguration) --no-build
+      publishTestResults: true
+
+  # The version is authored in Directory.Build.props rather than computed here: the catalog
+  # decides the deployed topology, so which version a deployment may pin is a reviewed change
+  # in the repo, not a build counter.
+  - script: |
+      set -euo pipefail
+      VERSION=$(dotnet msbuild src/Acme.Platform/Acme.Platform.csproj -getProperty:Version)
+      echo "Catalog version: ${VERSION}"
+      echo "##vso[task.setvariable variable=packageVersion]${VERSION}"
+    displayName: Resolve catalog version
+
+  - script: |
+      set -euo pipefail
+      dotnet tool install --global Akaule.NimBus.CommandLine --version "${{ parameters.nimbusVersion }}"
+      echo "##vso[task.prependpath]$HOME/.dotnet/tools"
+    displayName: Install nb CLI ${{ parameters.nimbusVersion }}
+
+  # Loads the built assembly exactly the way a deployment loads the published package, so a
+  # catalog `nb` cannot read fails here instead of halfway through provisioning someone's
+  # Service Bus namespace. The exports double as the documentation for this version.
+  - script: |
+      set -euo pipefail
+      ASSEMBLY=src/Acme.Platform/bin/$(buildConfiguration)/net10.0/Acme.Platform.dll
+      OUT="$(Build.ArtifactStagingDirectory)/catalog"
+      mkdir -p "$OUT"
+      nb topology export --assembly "$ASSEMBLY" --output "$OUT/platform-config.json"
+      nb catalog export  --assembly "$ASSEMBLY" --output "$OUT/eventcatalog"
+      echo "Endpoints in this catalog:"
+      grep -o '"id": *"[^"]*Endpoint"' "$OUT/platform-config.json" | sort -u
+    displayName: "Validate: export the topology and catalog docs"
+
+  - task: PublishPipelineArtifact@1
+    displayName: Publish catalog docs
+    inputs:
+      targetPath: $(Build.ArtifactStagingDirectory)/catalog
+      artifact: catalog
+
+  - script: |
+      set -euo pipefail
+      dotnet pack src/Acme.Platform/Acme.Platform.csproj \
+        -c "$(buildConfiguration)" --no-build \
+        -o "$(Build.ArtifactStagingDirectory)/nupkgs"
+    displayName: Pack
+
+  - task: NuGetAuthenticate@1
+    displayName: Authenticate to Azure Artifacts
+    condition: and(succeeded(), eq(variables.isMain, true))
+
+  # --skip-duplicate makes a re-run of an unchanged main a no-op instead of a failure: feeds
+  # reject a version that already exists, and that is the correct outcome — a published
+  # version is immutable because a deployment pins it.
+  - script: |
+      set -euo pipefail
+      dotnet nuget push "$(Build.ArtifactStagingDirectory)/nupkgs/*.nupkg" \
+        --source "${{ parameters.feedIndexUrl }}" \
+        --api-key az \
+        --skip-duplicate
+    displayName: Push to the private feed
+    condition: and(succeeded(), eq(variables.isMain, true))
+
+  - script: |
+      set -euo pipefail
+      echo "Published Acme.Platform $(packageVersion)."
+      echo ""
+      echo "To deploy this catalog, pin it in Acme's artifacts pipeline:"
+      echo "  platformPackage: Acme.Platform@$(packageVersion)"
+      echo "  platformFeed:    ${{ parameters.feedBaseUrl }}"
+    displayName: "Next step: pin this version in the deployment"
+    condition: and(succeeded(), eq(variables.isMain, true))

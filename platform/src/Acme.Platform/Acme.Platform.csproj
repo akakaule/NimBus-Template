@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>true</IsPackable>
+    <!-- Package id is org-qualified; the assembly name is not. The CLI stages this assembly
+         next to the WebApp's own binaries and refuses a name the WebApp already ships
+         (AppDeploymentService.StageWebAppWithPlatform), so 'Acme.Platform.dll' stays
+         deliberately outside the NimBus.* family. -->
+    <PackageId>Acme.Platform</PackageId>
+    <Title>Acme platform catalog</Title>
+    <Description>Acme integration catalog: CRM, ERP, DataPlatform and PartnerPortal endpoints with their event contracts. Consumed by `nb setup --platform-package` to provision the Service Bus topology and render the NimBus management UI.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Akaule.NimBus.Abstractions" Version="$(NimBusVersion)" />
+  </ItemGroup>
+
+</Project>

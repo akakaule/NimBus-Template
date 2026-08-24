@@ -1,0 +1,284 @@
+# Deploys NimBus into your Azure subscription from the published release artifacts.
+#
+# Everything it needs comes from nuget.org: the `nb` CLI carries the bicep templates and
+# downloads the prebuilt Resolver and WebApp for its own version. There is no submodule, no
+# Node.js and no build of NimBus — the NimBus sources are not involved at all.
+#
+# It deploys on every push to main. A run is reproducible from this file alone, because both
+# versions that decide what lands — the CLI and the platform catalog — are pinned here, so
+# the environment changes only when a commit changes this file. Still runnable by hand.
+#
+# Replace every parameter marked REPLACE before the first run.
+trigger:
+  branches:
+    include:
+      - main
+
+# Deploy on merge, not on proposal — a PR build would push a branch's changes onto the
+# shared environment before anyone approved them.
+pr: none
+
+parameters:
+  # REPLACE: short identifier for your solution. It is the stem of the Azure resource names
+  # this creates (sb-<solutionId>-<environment>, webapp-<solutionId>-<environment>-management,
+  # …), so pick something short, lowercase and stable — changing it later provisions a
+  # parallel set of resources rather than renaming the existing ones.
+  - name: solutionId
+    displayName: "Solution identifier used in Azure resource names"
+    type: string
+    default: acme
+  - name: environment
+    displayName: "Environment name (e.g. dev, staging, prod)"
+    type: string
+    default: dev
+  # REPLACE: created if it does not already exist.
+  - name: resourceGroup
+    displayName: "Azure resource group name (created if missing)"
+    type: string
+    default: rg-acme-dev
+  # REPLACE: the Azure service connection in your ADO project. Its identity needs Owner — or
+  # Contributor plus Role Based Access Control Administrator — on the target scope, because
+  # the deployment creates role assignments. See NimBus docs/azure-requirements.md.
+  - name: azureServiceConnection
+    displayName: "Azure service connection name"
+    type: string
+    default: acme-azure
+  # REPLACE: deliberately an all-zero placeholder, so a first run against an unconfigured
+  # pipeline fails immediately instead of deploying somewhere unintended.
+  - name: subscriptionId
+    displayName: "Azure subscription to deploy into"
+    type: string
+    default: 00000000-0000-0000-0000-000000000000
+  # Applies to new resources only; existing ones keep the region they were created in.
+  - name: location
+    displayName: "Azure region for new resources (existing resources keep their region)"
+    type: string
+    default: westeurope
+  - name: resolverPlan
+    displayName: "Resolver hosting plan: FlexConsumption | ElasticPremium (empty = keep existing plan)"
+    type: string
+    default: FlexConsumption
+  - name: managementPlanSku
+    displayName: "Management App Service Plan SKU (empty = keep existing SKU)"
+    type: string
+    default: B1
+  # Pinned deliberately rather than 'latest': the CLI version selects the deployment
+  # artifacts, so an upgrade should be a reviewed change to this file, never something
+  # a release on nuget.org does to a running environment on its own.
+  - name: nimbusVersion
+    displayName: "Akaule.NimBus.CommandLine version to install and deploy"
+    type: string
+    default: 3.2.0
+  # REPLACE: your catalog, published by the platform repo (../platform in this template).
+  # It decides the Service Bus topology and what the management UI renders, so the version is
+  # pinned rather than floated — a merge in the platform repo must not reroute a running
+  # environment on its own. Moving the pin is a reviewed change here.
+  #
+  # Leave it empty to deploy NimBus's built-in demo catalog (Storefront/Billing/Warehouse),
+  # which is useful for a first run before your own catalog is published.
+  - name: platformPackage
+    displayName: "Platform catalog package (<Id>@<Version>, empty = NimBus's built-in catalog)"
+    type: string
+    default: Acme.Platform@1.0.0
+  # REPLACE: the feed base, NOT the service index. The CLI appends /v3/index.json itself and
+  # reads the flat-container address from it, so passing a full index URL 404s in a way that
+  # reads like a missing package.
+  #
+  # A project-scoped feed carries a project segment as below; an organisation-scoped feed has
+  # none (https://pkgs.dev.azure.com/<org>/_packaging/<feed>/nuget). Addressing the wrong
+  # scope fails with "the feed with ID '<feed>' doesn't exist", which reads like a missing
+  # feed. Prefer the project's id over its name — no percent-encoding, survives a rename.
+  - name: platformFeed
+    displayName: "Feed serving the platform package (no /v3/index.json)"
+    type: string
+    default: https://pkgs.dev.azure.com/acme/00000000-0000-0000-0000-000000000000/_packaging/acme-platform/nuget
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  # The checkout is only here for this file. Nothing in the repository is read by the
+  # deployment itself — the applications come from nuget.org and the catalog from your feed.
+  - checkout: self
+
+  # The only toolchain requirement: the SDK that installs the tool. No Node.js, because the
+  # WebApp's SPA is already built inside the downloaded artifact.
+  - task: UseDotNet@2
+    displayName: Setup .NET 10
+    inputs:
+      packageType: sdk
+      version: 10.0.x
+
+  - script: |
+      set -euo pipefail
+      dotnet tool install --global Akaule.NimBus.CommandLine --version "${{ parameters.nimbusVersion }}"
+      echo "##vso[task.prependpath]$HOME/.dotnet/tools"
+    displayName: Install nb CLI from nuget.org
+
+  - task: AzureCLI@2
+    displayName: "Deploy: infra + topology + apps (nb setup)"
+    env:
+      NB_RESOLVER_PLAN: ${{ parameters.resolverPlan }}
+      NB_MANAGEMENT_PLAN_SKU: ${{ parameters.managementPlanSku }}
+      NB_PLATFORM_PACKAGE: ${{ parameters.platformPackage }}
+      # The feed is private, so the CLI needs a credential to read it. It goes out as the
+      # password half of Basic auth over HTTPS; the build service identity needs read access
+      # to the feed for this to resolve.
+      NIMBUS_PLATFORM_FEED_TOKEN: $(System.AccessToken)
+    inputs:
+      azureSubscription: ${{ parameters.azureServiceConnection }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        az account set --subscription "${{ parameters.subscriptionId }}"
+        az group create --name "${{ parameters.resourceGroup }}" --location "${{ parameters.location }}" --output none
+        EXTRA_ARGS=()
+        if [ -n "$NB_RESOLVER_PLAN" ]; then EXTRA_ARGS+=(--resolver-plan "$NB_RESOLVER_PLAN"); fi
+        if [ -n "$NB_MANAGEMENT_PLAN_SKU" ]; then EXTRA_ARGS+=(--management-plan-sku "$NB_MANAGEMENT_PLAN_SKU"); fi
+        # One catalog for both halves of the deployment: it provisions the topology and its
+        # assemblies are staged into the WebApp zip, so the UI shows these endpoints too.
+        if [ -n "$NB_PLATFORM_PACKAGE" ]; then
+          EXTRA_ARGS+=(--platform-package "$NB_PLATFORM_PACKAGE" --platform-feed "${{ parameters.platformFeed }}")
+        fi
+        nb setup \
+          --solution-id "${{ parameters.solutionId }}" \
+          --environment "${{ parameters.environment }}" \
+          --resource-group "${{ parameters.resourceGroup }}" \
+          --location "${{ parameters.location }}" \
+          "${EXTRA_ARGS[@]}"
+
+  # Proves the deployed apps are the artifacts this CLI version carries, which is the
+  # whole claim of the artifact method.
+  #
+  # The version deliberately does NOT come from /api/app/stats. That endpoint stays
+  # anonymous so liveness probes keep working, but its payload is authenticated-only
+  # (NimBus GH#93) — environment name, exact version and backend topology would let an
+  # unauthenticated scanner fingerprint the deployment. An anonymous caller gets
+  # {"env":null,"platformVersion":null,...}, so there is nothing to assert against, and
+  # this pipeline's service principal is an Azure RBAC identity rather than a WebApp
+  # user, so it cannot sign in to that API either.
+  #
+  # What it can do is read the deployed files over SCM/Kudu with the same ARM token it
+  # deployed with. NimBus.WebApp.deps.json carries the version the release build stamped
+  # on the assemblies — the same value stats reports to a signed-in operator.
+  - task: AzureCLI@2
+    displayName: "Verify: deployed version matches the CLI"
+    env:
+      # The last assertion re-exports the pinned catalog to compare it against the
+      # provisioned topology, which means reading the private feed again.
+      NIMBUS_PLATFORM_FEED_TOKEN: $(System.AccessToken)
+    inputs:
+      azureSubscription: ${{ parameters.azureServiceConnection }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        az account set --subscription "${{ parameters.subscriptionId }}"
+        APP="webapp-${{ parameters.solutionId }}-${{ parameters.environment }}-management"
+        HOST=$(az webapp show \
+          --resource-group "${{ parameters.resourceGroup }}" \
+          --name "$APP" \
+          --query defaultHostName --output tsv)
+        SCM=$(az webapp show \
+          --resource-group "${{ parameters.resourceGroup }}" \
+          --name "$APP" \
+          --query "enabledHostNames[?contains(@, '.scm.')] | [0]" --output tsv)
+        echo "Management WebApp: https://${HOST}"
+
+        # The app has just been zip-deployed and may still be starting.
+        STATUS=000
+        for attempt in $(seq 1 20); do
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "https://${HOST}/alive" || true)
+          if [ "$STATUS" = "200" ]; then break; fi
+          sleep 15
+        done
+        if [ "$STATUS" != "200" ]; then
+          echo "##vso[task.logissue type=error]The management WebApp never reported healthy on /alive (last status ${STATUS})."
+          exit 1
+        fi
+        echo "Management WebApp is live."
+
+        # Kudu accepts the ARM token, so no publishing profile or basic SCM credentials
+        # are needed — the deployment identity is already entitled to read the site.
+        TOKEN=$(az account get-access-token --resource https://management.azure.com --query accessToken --output tsv)
+        # Downloaded to a file rather than a variable: deps.json is ~90 KB, and
+        # `echo "$DEPS" | grep -q` would have grep close the pipe on its first match,
+        # killing echo with SIGPIPE and failing the whole pipeline under `pipefail`.
+        DEPS=$(mktemp)
+        DOWNLOADED=false
+        for attempt in $(seq 1 5); do
+          if curl -fsS -H "Authorization: Bearer ${TOKEN}" \
+            "https://${SCM}/api/vfs/site/wwwroot/NimBus.WebApp.deps.json" --output "$DEPS"; then
+            DOWNLOADED=true
+            break
+          fi
+          sleep 10
+        done
+        if [ "$DOWNLOADED" != true ]; then
+          echo "##vso[task.logissue type=error]Could not read NimBus.WebApp.deps.json from https://${SCM}, so the deployed version could not be confirmed."
+          exit 1
+        fi
+
+        if ! grep -q "\"NimBus.WebApp/${{ parameters.nimbusVersion }}\"" "$DEPS"; then
+          echo "Deployed WebApp: $(grep -o '"NimBus.WebApp/[^"]*"' "$DEPS" | sort -u | tr '\n' ' ')"
+          echo "##vso[task.logissue type=error]Deployed WebApp does not match the pinned CLI version ${{ parameters.nimbusVersion }}."
+          exit 1
+        fi
+        echo "Deployed WebApp assemblies are stamped ${{ parameters.nimbusVersion }}."
+
+        # ---------- and that the pinned catalog is the one running ----------
+        if [ -z "${{ parameters.platformPackage }}" ]; then
+          echo "No platform package pinned; this environment runs NimBus's built-in demo catalog."
+          exit 0
+        fi
+
+        # The CLI records what it staged into the site. Absent settings mean the WebApp fell
+        # back to its built-in catalog, which looks like a successful deployment of the wrong
+        # thing — the failure mode this assertion exists for.
+        PLATFORM_TYPE=$(az webapp config appsettings list \
+          --resource-group "${{ parameters.resourceGroup }}" --name "$APP" \
+          --query "[?name=='NimBus__PlatformType'].value | [0]" --output tsv)
+        PLATFORM_ASSEMBLY=$(az webapp config appsettings list \
+          --resource-group "${{ parameters.resourceGroup }}" --name "$APP" \
+          --query "[?name=='NimBus__PlatformAssembly'].value | [0]" --output tsv)
+        if [ -z "$PLATFORM_TYPE" ] || [ -z "$PLATFORM_ASSEMBLY" ]; then
+          echo "##vso[task.logissue type=error]The WebApp has no NimBus__PlatformType/NimBus__PlatformAssembly setting, so it is still rendering NimBus's built-in catalog."
+          exit 1
+        fi
+        echo "WebApp catalog: ${PLATFORM_TYPE} from ${PLATFORM_ASSEMBLY}"
+
+        # The setting names a file the WebApp resolves against its content root. If the zip
+        # did not actually carry it, every request that touches IPlatform throws at startup.
+        ASSEMBLY_STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" \
+          "https://${SCM}/api/vfs/site/wwwroot/${PLATFORM_ASSEMBLY}" || true)
+        if [ "$ASSEMBLY_STATUS" != "200" ]; then
+          echo "##vso[task.logissue type=error]${PLATFORM_ASSEMBLY} is not in the deployed site (HTTP ${ASSEMBLY_STATUS}); the WebApp would fail every request that reads the catalog."
+          exit 1
+        fi
+
+        # Topology last: every endpoint the catalog declares must have a topic in the
+        # namespace. The expectation is exported from the same package the deployment
+        # resolved, so this compares Azure against the catalog rather than against a list
+        # hardcoded here that would rot the first time an endpoint is added.
+        CATALOG=$(mktemp)
+        nb topology export \
+          --platform-package "${{ parameters.platformPackage }}" \
+          --platform-feed "${{ parameters.platformFeed }}" \
+          --output "$CATALOG"
+        TOPICS=$(mktemp)
+        az servicebus topic list \
+          --resource-group "${{ parameters.resourceGroup }}" \
+          --namespace-name "sb-${{ parameters.solutionId }}-${{ parameters.environment }}" \
+          --query "[].name" --output tsv > "$TOPICS"
+        MISSING=""
+        for ENDPOINT in $(grep -o '"id": *"[^"]*Endpoint"' "$CATALOG" | grep -o '[A-Za-z0-9]*Endpoint' | sort -u); do
+          TOPIC=$(echo "$ENDPOINT" | tr '[:upper:]' '[:lower:]')
+          if ! grep -qx "$TOPIC" "$TOPICS"; then MISSING="${MISSING} ${TOPIC}"; fi
+        done
+        if [ -n "$MISSING" ]; then
+          echo "Topics in the namespace: $(tr '\n' ' ' < "$TOPICS")"
+          echo "##vso[task.logissue type=error]The catalog declares endpoints with no topic:${MISSING}."
+          exit 1
+        fi
+        echo "Topology matches ${{ parameters.platformPackage }}: $(tr '\n' ' ' < "$TOPICS")"
