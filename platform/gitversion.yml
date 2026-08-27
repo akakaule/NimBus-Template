@@ -1,0 +1,27 @@
+# GitVersion decides the package version from git, so a
+# version never has to be authored in the repo.
+#
+#   feature/*  ->  1.1.1-<branch>.N   pre-release, for trying a catalog against a dev environment
+#   main       ->  1.1.1-rc.N         release candidate, published on every merge
+#   tag 1.1.1  ->  1.1.1              stable; what a deployment pins
+#
+# next-version is only the floor for the first release: once a tag exists the tag wins and
+# every later build counts up from it, so this line does not need maintaining.
+mode: ContinuousDeployment
+next-version: 1.1.0
+assembly-versioning-scheme: MajorMinorPatch
+assembly-file-versioning-scheme: MajorMinorPatchTag
+assembly-file-versioning-format: '{Major}.{Minor}.{Patch}.{WeightedPreReleaseNumber}'
+branches:
+  feature:
+    tag: useBranchName
+    increment: Patch
+    prevent-increment-of-merged-branch-version: false
+  master:
+    regex: ^master$|^main$
+    tag: 'rc'
+    increment: Patch
+    is-release-branch: false
+    prevent-increment-of-merged-branch-version: false
+ignore:
+  sha: []

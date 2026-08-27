@@ -107,6 +107,22 @@ public class EventContractTests
     }
 
     [TestMethod]
+    public void Account_address_is_a_nested_object_and_not_an_event_type()
+    {
+        // The catalog's showcase that event fields can be structured. Address must stay a
+        // plain class: were it to derive from Event it would become a routing key of its own.
+        var property = typeof(CrmAccountCreated).GetProperty(nameof(CrmAccountCreated.RegisteredAddress))!;
+        Assert.AreEqual(typeof(Address), property.PropertyType);
+        Assert.IsFalse(typeof(Event).IsAssignableFrom(typeof(Address)), "Address must not be an Event.");
+
+        var address = CrmAccountCreated.Example.RegisteredAddress;
+        foreach (var value in new[] { address.Street, address.PostalCode, address.City, address.CountryCode })
+        {
+            Assert.IsFalse(string.IsNullOrWhiteSpace(value), "The Example's RegisteredAddress must be fully populated.");
+        }
+    }
+
+    [TestMethod]
     public void Contact_details_are_masked_by_the_mode_that_fits_them()
     {
         // The PII carrier of this catalog. Asserting the modes — not merely the presence of

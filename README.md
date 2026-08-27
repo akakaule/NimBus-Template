@@ -70,8 +70,10 @@ step that most often bites — see [below](#when-it-goes-wrong).
 **6 — Replace every `REPLACE` parameter** in both pipelines, then register them (Pipelines →
 New pipeline → Azure Repos Git → Existing YAML file).
 
-**7 — Run the platform pipeline**, then the deploy pipeline. The platform pipeline prints the
-exact `platformPackage` line to paste into the deployment.
+**7 — Tag the platform repo** (`git tag 1.1.0 && git push origin 1.1.0`) so the platform
+pipeline publishes a stable version — a plain push to `main` publishes only an `-rc`
+pre-release — then run the deploy pipeline. The platform pipeline prints the exact
+`platformPackage` line to paste into the deployment.
 
 ## When it goes wrong
 
@@ -101,7 +103,7 @@ catalog's endpoints have topics in the namespace.
 
 ## Versions
 
-This template is pinned to **NimBus 3.2.0**, in three places that must move together:
+This template is pinned to **NimBus 3.4.0**, in three places that must move together:
 
 - `deploy/pipelines/azure-pipelines-deploy.yml` → `nimbusVersion`
 - `platform/Directory.Build.props` → `NimBusVersion` (the `Akaule.NimBus.Abstractions` your

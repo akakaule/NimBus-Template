@@ -20,6 +20,13 @@ public class CrmAccountCreated : Event
         CountryCode = "DK",
         VatNumber = "DK12345678",
         SalesRegion = "Nordics",
+        RegisteredAddress = new Address
+        {
+            Street = "Havnegade 27, 2.",
+            PostalCode = "9000",
+            City = "Aalborg",
+            CountryCode = "DK",
+        },
     };
 
     [Required]
@@ -39,4 +46,10 @@ public class CrmAccountCreated : Event
 
     [Description("Sales region the account is managed from.")]
     public string SalesRegion { get; set; } = string.Empty;
+
+    // A nested object rather than four flat address fields: the ERP mirrors the whole address
+    // as one unit, and the catalog gets to show that event fields can be structured.
+    [Required]
+    [Description("The address the company is registered at.")]
+    public Address RegisteredAddress { get; set; } = new();
 }

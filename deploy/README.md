@@ -23,7 +23,7 @@ pipeline its own YAML. There is no NimBus clone, no submodule, no Node.js and no
 
 ## What it provisions
 
-Service Bus namespace, Cosmos DB (or SQL Server, per `--storage-provider`), storage account,
+Service Bus namespace, Azure SQL (or Cosmos DB, per `storageProvider`), storage account,
 Application Insights, an App Service plan with the management WebApp, and a Function App for
 the Resolver — plus **role assignments**, which is why the service connection's identity needs
 Owner, or Contributor plus Role Based Access Control Administrator. The full inventory,
@@ -59,6 +59,13 @@ principal is an Azure RBAC identity rather than a WebApp user — it gets
    `Microsoft.Web`, `Microsoft.Storage`, `Microsoft.Insights`, `Microsoft.DocumentDB`,
    `Microsoft.EventGrid`.
 4. Grant the identity your pipelines run as **read** access to the platform feed.
+5. Define the **secret** pipeline variables the chosen store needs — the run fails before it
+   touches Azure if one is missing:
+   - `NIMBUS_SQL_ADMIN_PASSWORD` for `storageProvider: sqlserver` + `sqlMode: provision`
+   - `NIMBUS_SQL_CONNECTION_STRING` for `sqlMode: external`
+   - `NIMBUS_IDENTITY_ADMIN_PASSWORD` when `identityAdminEmail` is set (seeds a
+     username/password admin so a torn-down environment comes back with a sign-in; the
+     alternative is configuring `AzureAd__*` on the WebApp by hand after each teardown)
 
 To do a first run before your catalog exists, set `platformPackage` to an empty string — that
 deploys NimBus's built-in demo catalog, which is a good way to separate "does my Azure setup

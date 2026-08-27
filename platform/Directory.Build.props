@@ -9,17 +9,15 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <!-- The catalog decides the Service Bus topology and what the management UI renders, so
-         the version a deployment pins is a reviewed change: bump this, merge, and then move
-         the platform-package pin in the deploy pipeline. The publish pipeline pushes with
-         skip-duplicate, so re-running a build that did not bump this is a no-op rather than
-         a failure. -->
-    <VersionPrefix>1.0.0</VersionPrefix>
+    <!-- No version here: GitVersion computes it in the pipeline from branches and tags
+         (see gitversion.yml) and passes it as /p:Version. A local build is 1.0.0-local so
+         it can never be mistaken for something the feed published. -->
+    <Version Condition="'$(Version)' == ''">1.0.0-local</Version>
 
     <!-- The `nb` CLI reflection-loads this assembly to read the catalog, so it must be built
          against the NimBus version the deployment runs. Kept in one place because the deploy
          pipeline pins the same number for the CLI itself. -->
-    <NimBusVersion>3.2.0</NimBusVersion>
+    <NimBusVersion>3.4.0</NimBusVersion>
   </PropertyGroup>
 
   <!-- REPLACE: your organisation and the repository this ends up in. The URLs are metadata

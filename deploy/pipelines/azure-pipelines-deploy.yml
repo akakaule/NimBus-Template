@@ -62,13 +62,65 @@ parameters:
     displayName: "Management App Service Plan SKU (empty = keep existing SKU)"
     type: string
     default: B1
+  # Which store the Resolver and the WebApp read and write. Toggling this switches the
+  # provider the deployed apps use; it does NOT migrate anything, so message history, audit
+  # trail and metrics written to the other store stay there and stop being visible.
+  - name: storageProvider
+    displayName: "Message store"
+    type: string
+    default: sqlserver
+    values:
+      - sqlserver
+      - cosmos
+  # sqlserver only. 'provision' deploys the Azure SQL server and database from the bicep
+  # templates; 'external' points the apps at a server you already run, read from the secret
+  # variable NIMBUS_SQL_CONNECTION_STRING.
+  - name: sqlMode
+    displayName: "SQL: provision a server, or use an external one"
+    type: string
+    default: provision
+    values:
+      - provision
+      - external
+  - name: sqlAdminLogin
+    displayName: "SQL admin login (sqlserver + provision)"
+    type: string
+    default: nimbusadmin
+  # The WebApp needs a sign-in, and the bicep creates no Entra app registration: if you use
+  # Entra, AzureAd__ClientId and friends are configured by hand on the WebApp and every
+  # deployment carries them forward — which also means a torn-down environment comes back
+  # without them, throwing IDW10106 on every request, /alive included.
+  #
+  # Setting this instead seeds ASP.NET Core Identity: a username/password admin created on
+  # first boot, described entirely by this pipeline and therefore reproducible after a
+  # teardown. It needs the SQL store (the accounts live in that database) and the
+  # NIMBUS_IDENTITY_ADMIN_PASSWORD secret. Both auth paths can run at once; the WebApp accepts
+  # either sign-in.
+  #
+  # 'none' rather than an empty string: Azure DevOps renders a parameter whose default is ""
+  # as Required in the run dialog and greys out the Run button, so an "unset" default has to
+  # be a word.
+  - name: identityAdminEmail
+    displayName: "Seed this address as the first admin (sqlserver only; 'none' = leave auth alone)"
+    type: string
+    default: none
+  # 'auto' lets the CLI derive sql-{solutionId}-{environment}. Name it explicitly when that
+  # DNS name is taken: SQL server names are globally unique, and a deleted one stays reserved
+  # for 24-72 hours.
+  #
+  # 'auto' rather than an empty string for the same reason as identityAdminEmail above: an
+  # empty default renders as Required in the run dialog and blocks the Run button.
+  - name: sqlServerName
+    displayName: "SQL server name ('auto' = sql-<solutionId>-<environment>)"
+    type: string
+    default: auto
   # Pinned deliberately rather than 'latest': the CLI version selects the deployment
   # artifacts, so an upgrade should be a reviewed change to this file, never something
   # a release on nuget.org does to a running environment on its own.
   - name: nimbusVersion
     displayName: "Akaule.NimBus.CommandLine version to install and deploy"
     type: string
-    default: 3.2.0
+    default: 3.4.0
   # REPLACE: your catalog, published by the platform repo (../platform in this template).
   # It decides the Service Bus topology and what the management UI renders, so the version is
   # pinned rather than floated — a merge in the platform repo must not reroute a running
@@ -121,18 +173,33 @@ steps:
       NB_RESOLVER_PLAN: ${{ parameters.resolverPlan }}
       NB_MANAGEMENT_PLAN_SKU: ${{ parameters.managementPlanSku }}
       NB_PLATFORM_PACKAGE: ${{ parameters.platformPackage }}
+      NB_STORAGE_PROVIDER: ${{ parameters.storageProvider }}
+      NB_SQL_MODE: ${{ parameters.sqlMode }}
+      NB_SQL_ADMIN_LOGIN: ${{ parameters.sqlAdminLogin }}
+      NB_SQL_SERVER_NAME: ${{ parameters.sqlServerName }}
+      NB_IDENTITY_ADMIN_EMAIL: ${{ parameters.identityAdminEmail }}
       # The feed is private, so the CLI needs a credential to read it. It goes out as the
       # password half of Basic auth over HTTPS; the build service identity needs read access
       # to the feed for this to resolve.
       NIMBUS_PLATFORM_FEED_TOKEN: $(System.AccessToken)
+      # Mapped only on the SQL path, so a Cosmos run never carries a database credential in
+      # its environment. Both are read by the CLI from the environment rather than passed as
+      # arguments, which keeps them out of the command line and the run log. Define them as
+      # *secret* pipeline variables; the guard below fails the run if one is missing.
+      ${{ if eq(parameters.storageProvider, 'sqlserver') }}:
+        NIMBUS_SQL_ADMIN_PASSWORD: $(NIMBUS_SQL_ADMIN_PASSWORD)
+        NIMBUS_SQL_CONNECTION_STRING: $(NIMBUS_SQL_CONNECTION_STRING)
+        # Seeded into the Identity store on first boot. @secure() in the bicep, so it stays
+        # out of the deployment history as well as out of the log.
+        NIMBUS_IDENTITY_ADMIN_PASSWORD: $(NIMBUS_IDENTITY_ADMIN_PASSWORD)
     inputs:
       azureSubscription: ${{ parameters.azureServiceConnection }}
       scriptType: bash
       scriptLocation: inlineScript
       inlineScript: |
         set -euo pipefail
-        az account set --subscription "${{ parameters.subscriptionId }}"
-        az group create --name "${{ parameters.resourceGroup }}" --location "${{ parameters.location }}" --output none
+        # Everything that can be decided without Azure is decided first, so a misconfigured
+        # run fails before it creates a resource group it will not fill.
         EXTRA_ARGS=()
         if [ -n "$NB_RESOLVER_PLAN" ]; then EXTRA_ARGS+=(--resolver-plan "$NB_RESOLVER_PLAN"); fi
         if [ -n "$NB_MANAGEMENT_PLAN_SKU" ]; then EXTRA_ARGS+=(--management-plan-sku "$NB_MANAGEMENT_PLAN_SKU"); fi
@@ -141,6 +208,53 @@ steps:
         if [ -n "$NB_PLATFORM_PACKAGE" ]; then
           EXTRA_ARGS+=(--platform-package "$NB_PLATFORM_PACKAGE" --platform-feed "${{ parameters.platformFeed }}")
         fi
+
+        EXTRA_ARGS+=(--storage-provider "$NB_STORAGE_PROVIDER")
+        if [ "$NB_STORAGE_PROVIDER" = "sqlserver" ]; then
+          EXTRA_ARGS+=(--sql-mode "$NB_SQL_MODE")
+          if [ "$NB_SQL_MODE" = "provision" ]; then
+            # An undefined pipeline variable expands to the literal '$(NAME)', so an empty
+            # check alone would let that reach Azure as the admin password. Reject both.
+            case "${NIMBUS_SQL_ADMIN_PASSWORD:-}" in
+              ''|'$('*)
+                echo "##vso[task.logissue type=error]Define a secret pipeline variable NIMBUS_SQL_ADMIN_PASSWORD to provision Azure SQL, or switch sqlMode to 'external'."
+                exit 1
+                ;;
+            esac
+            EXTRA_ARGS+=(--sql-admin-login "$NB_SQL_ADMIN_LOGIN")
+            # 'auto' and empty both mean "let the CLI derive it".
+            if [ -n "$NB_SQL_SERVER_NAME" ] && [ "$NB_SQL_SERVER_NAME" != "auto" ]; then
+              EXTRA_ARGS+=(--sql-server-name "$NB_SQL_SERVER_NAME")
+            fi
+          else
+            case "${NIMBUS_SQL_CONNECTION_STRING:-}" in
+              ''|'$('*)
+                echo "##vso[task.logissue type=error]sqlMode 'external' needs a secret pipeline variable NIMBUS_SQL_CONNECTION_STRING pointing at your SQL server."
+                exit 1
+                ;;
+            esac
+          fi
+        fi
+
+        # Sign-in. Without one of the two paths the WebApp throws IDW10106 on every request
+        # and even /alive returns 500, so this fails the run before deploying rather than
+        # leaving an environment nobody can log into.
+        if [ -n "$NB_IDENTITY_ADMIN_EMAIL" ] && [ "$NB_IDENTITY_ADMIN_EMAIL" != "none" ]; then
+          if [ "$NB_STORAGE_PROVIDER" != "sqlserver" ]; then
+            echo "##vso[task.logissue type=error]identityAdminEmail requires storageProvider 'sqlserver' — the accounts live in the same database. Clear it and configure AzureAd__* on the WebApp instead."
+            exit 1
+          fi
+          case "${NIMBUS_IDENTITY_ADMIN_PASSWORD:-}" in
+            ''|'$('*)
+              echo "##vso[task.logissue type=error]Define a secret pipeline variable NIMBUS_IDENTITY_ADMIN_PASSWORD to seed the first admin, or clear identityAdminEmail."
+              exit 1
+              ;;
+          esac
+          EXTRA_ARGS+=(--identity-admin-email "$NB_IDENTITY_ADMIN_EMAIL")
+        fi
+
+        az account set --subscription "${{ parameters.subscriptionId }}"
+        az group create --name "${{ parameters.resourceGroup }}" --location "${{ parameters.location }}" --output none
         nb setup \
           --solution-id "${{ parameters.solutionId }}" \
           --environment "${{ parameters.environment }}" \

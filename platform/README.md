@@ -29,8 +29,13 @@ floating version would let a merge here reroute production traffic without a rev
 | `DataPlatformEndpoint` | DataPlatform | — | all seven business events |
 | `PartnerPortalEndpoint` | PartnerPortal | `PartnerLeadSubmitted` | — |
 
-Two details worth knowing before you add anything:
+Three details worth knowing before you add anything:
 
+- **Event fields can be structured.** `CrmAccountCreated.RegisteredAddress` is an `Address`
+  — a plain class, not an `Event` — that arrives as a nested JSON object. Its members carry
+  their own descriptions and validation, and the management UI, the example payload and the
+  catalog export all render it as a type of its own. `[Sensitive]` on such a class masks
+  every member at once.
 - **`PlaceCustomerOnCreditHold` is a `Command`**, not an event. A command instructs one system
   to act, so the catalog must declare **exactly one** consumer. Zero dead-letters every send;
   two silently turn an instruction into a broadcast. `PlatformValidation` enforces it at
@@ -54,7 +59,7 @@ To see what NimBus will make of a change before publishing anything, point the C
 build output — this is the same reflection load the deployment performs:
 
 ```bash
-dotnet tool install --global Akaule.NimBus.CommandLine --version 3.2.0
+dotnet tool install --global Akaule.NimBus.CommandLine --version 3.4.0
 
 # The topology NimBus would provision
 nb topology export --assembly src/Acme.Platform/bin/Release/net10.0/Acme.Platform.dll \
@@ -70,12 +75,29 @@ load fails the build instead of the deployment.
 
 ## Publishing
 
-`pipelines/azure-pipelines-platform.yml` runs on every push to `main`: build → test → export
-the catalog → `dotnet pack` → push to the Azure Artifacts feed with `--skip-duplicate`.
+`pipelines/azure-pipelines-platform.yml` runs on every push to `main` or `feature/*` and on
+every tag: build → test → export the catalog → `dotnet pack` → push to the Azure Artifacts
+feed with `--skip-duplicate`. Pull requests build and validate but never publish.
 
-The version comes from `VersionPrefix` in `Directory.Build.props`. **Bump it in the same PR as
-the catalog change** — a build that does not bump it publishes nothing, because the version
-already exists on the feed. Pull requests build and validate but never publish.
+Nothing in the repo carries a version number. [GitVersion](gitversion.yml) computes it from
+git, so what you push decides what is published:
+
+| You push | Published version | Use it for |
+|---|---|---|
+| `feature/notifications` | `1.0.1-notifications.3` | trying a catalog against a dev environment |
+| `main` (merge) | `1.0.1-rc.2` | release candidate — test/UAT-style pins |
+| tag `1.0.1` on `main` | `1.0.1` | the stable version a deployment pins |
+
+The patch number counts up from the last tag, so a release is just a tag:
+
+```bash
+git tag 1.0.1 && git push origin 1.0.1
+```
+
+The first stable version is `next-version` in `gitversion.yml` (`1.1.0`) until a tag exists;
+after that the tag wins and the line no longer matters. Before the deployment can pin a
+version, one must exist on the feed: a bare `main` build publishes only an `-rc` pre-release,
+so tag it.
 
 ## Consuming it
 

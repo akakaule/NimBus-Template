@@ -1,18 +1,28 @@
-# Publishes the Acme platform catalog to a private Azure Artifacts feed.
+# Publishes the platform catalog to a private Azure Artifacts feed.
 #
 # The package this produces is the entire interface between this repository and any
 # deployment: `nb setup --platform-package Acme.Platform@<version>` resolves it
 # from the feed, provisions the Service Bus topology from the catalog inside it, and ships the
 # assembly with the management WebApp. No deployment ever clones or builds this repo.
 #
-# Every push to main runs the full job; only main publishes. Pull request validation is
-# configured through a branch policy (Azure Repos ignores a `pr:` trigger block in YAML), and
-# the publish step below is gated on the branch, so a PR build validates the catalog without
-# putting a version on the feed.
+# GitVersion (gitversion.yml) computes the version from git, so no version is authored in
+# the repo, and what gets published depends on what triggered the build.
+#
+#   feature/*   ->  1.1.1-<branch>.N   pre-release, to try a catalog against a dev environment
+#   main        ->  1.1.1-rc.N         release candidate on every merge
+#   tag 1.1.1   ->  1.1.1              stable; what a deployment pins
+#
+# Pull request validation is configured through a branch policy (Azure Repos ignores a `pr:`
+# trigger block in YAML). PR builds validate the catalog but never publish.
 trigger:
+  batch: true
   branches:
     include:
       - main
+      - feature/*
+  tags:
+    include:
+      - '*'
 
 parameters:
   # REPLACE both URLs with your feed. Copy them from Artifacts → your feed → Connect to feed →
@@ -39,17 +49,43 @@ parameters:
   - name: nimbusVersion
     displayName: "Akaule.NimBus.CommandLine version used to validate the catalog"
     type: string
-    default: 3.2.0
+    default: 3.4.0
 
 pool:
   vmImage: ubuntu-latest
 
 variables:
   buildConfiguration: Release
-  isMain: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+  shouldPublish: $[ne(variables['Build.Reason'], 'PullRequest')]
 
 steps:
+  # GitVersion needs the full history and the tags to count from the last release.
   - checkout: self
+    fetchDepth: 0
+    fetchTags: true
+
+  - task: gitversion/setup@3
+    displayName: Setup GitVersion
+    inputs:
+      versionSpec: 5.x
+
+  # Resolved explicitly rather than through the execute task's output variables: their
+  # names differ between task versions, and an unset macro silently fell through to the
+  # 1.0.0-local fallback in Directory.Build.props — which then got published.
+  - script: |
+      set -euo pipefail
+      VERSION=$(dotnet-gitversion /config gitversion.yml /showvariable FullSemVer)
+      echo "Catalog version: ${VERSION}"
+      echo "##vso[task.setvariable variable=catalogVersion]${VERSION}"
+      echo "##vso[build.updatebuildnumber]${VERSION}"
+    displayName: Resolve catalog version (GitVersion)
+
+  - script: |
+      set -euo pipefail
+      case "$(catalogVersion)" in
+        ''|*local*) echo "##vso[task.logissue type=error]Catalog version did not resolve: '$(catalogVersion)'"; exit 1 ;;
+      esac
+    displayName: "Guard: version resolved"
 
   - task: UseDotNet@2
     displayName: Setup .NET 10
@@ -59,7 +95,9 @@ steps:
 
   - script: |
       set -euo pipefail
-      dotnet build Acme.Platform.slnx -c "$(buildConfiguration)"
+      echo "Catalog version: $(catalogVersion)"
+      dotnet build Acme.Platform.slnx -c "$(buildConfiguration)" \
+        /p:Version="$(catalogVersion)"
     displayName: Build
 
   - task: DotNetCoreCLI@2
@@ -69,16 +107,6 @@ steps:
       projects: Acme.Platform.slnx
       arguments: -c $(buildConfiguration) --no-build
       publishTestResults: true
-
-  # The version is authored in Directory.Build.props rather than computed here: the catalog
-  # decides the deployed topology, so which version a deployment may pin is a reviewed change
-  # in the repo, not a build counter.
-  - script: |
-      set -euo pipefail
-      VERSION=$(dotnet msbuild src/Acme.Platform/Acme.Platform.csproj -getProperty:Version)
-      echo "Catalog version: ${VERSION}"
-      echo "##vso[task.setvariable variable=packageVersion]${VERSION}"
-    displayName: Resolve catalog version
 
   - script: |
       set -euo pipefail
@@ -110,14 +138,15 @@ steps:
       set -euo pipefail
       dotnet pack src/Acme.Platform/Acme.Platform.csproj \
         -c "$(buildConfiguration)" --no-build \
+        /p:Version="$(catalogVersion)" \
         -o "$(Build.ArtifactStagingDirectory)/nupkgs"
     displayName: Pack
 
   - task: NuGetAuthenticate@1
     displayName: Authenticate to Azure Artifacts
-    condition: and(succeeded(), eq(variables.isMain, true))
+    condition: and(succeeded(), eq(variables.shouldPublish, true))
 
-  # --skip-duplicate makes a re-run of an unchanged main a no-op instead of a failure: feeds
+  # --skip-duplicate makes a re-run of the same commit a no-op instead of a failure: feeds
   # reject a version that already exists, and that is the correct outcome — a published
   # version is immutable because a deployment pins it.
   - script: |
@@ -127,14 +156,14 @@ steps:
         --api-key az \
         --skip-duplicate
     displayName: Push to the private feed
-    condition: and(succeeded(), eq(variables.isMain, true))
+    condition: and(succeeded(), eq(variables.shouldPublish, true))
 
   - script: |
       set -euo pipefail
-      echo "Published Acme.Platform $(packageVersion)."
+      echo "Published Acme.Platform $(catalogVersion)."
       echo ""
-      echo "To deploy this catalog, pin it in Acme's artifacts pipeline:"
-      echo "  platformPackage: Acme.Platform@$(packageVersion)"
+      echo "To deploy this catalog, pin it in the deploy repo's pipeline:"
+      echo "  platformPackage: Acme.Platform@$(catalogVersion)"
       echo "  platformFeed:    ${{ parameters.feedBaseUrl }}"
     displayName: "Next step: pin this version in the deployment"
-    condition: and(succeeded(), eq(variables.isMain, true))
+    condition: and(succeeded(), eq(variables.shouldPublish, true))
