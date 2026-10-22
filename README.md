@@ -103,7 +103,7 @@ catalog's endpoints have topics in the namespace.
 
 ## Versions
 
-This template is pinned to **NimBus 3.4.0**, in three places that must move together:
+This template is pinned to **NimBus 4.8.0**, in three places that must move together:
 
 - `deploy/pipelines/azure-pipelines-deploy.yml` → `nimbusVersion`
 - `platform/Directory.Build.props` → `NimBusVersion` (the `Akaule.NimBus.Abstractions` your

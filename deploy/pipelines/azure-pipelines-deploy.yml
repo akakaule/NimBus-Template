@@ -62,6 +62,20 @@ parameters:
     displayName: "Management App Service Plan SKU (empty = keep existing SKU)"
     type: string
     default: B1
+  # Resolver capacity. The Resolver is bounded by what the message store can absorb, not by
+  # Service Bus: 200 sessions per instance produced a throttling storm in production, which is
+  # why NimBus defaults to 16. Raise it together with the store's throughput, not instead of it.
+  #
+  # 'auto' rather than an empty string for the same reason as identityAdminEmail below: an
+  # empty default renders as Required in the run dialog and blocks the Run button.
+  - name: resolverMaxSessions
+    displayName: "Resolver Service Bus sessions per instance, 1-200 ('auto' = 16)"
+    type: string
+    default: auto
+  - name: resolverMaxInstances
+    displayName: "Resolver instance ceiling: ElasticPremium 0-10 (0 = no cap), FlexConsumption 1-1000 ('auto' = no cap / 100)"
+    type: string
+    default: auto
   # Which store the Resolver and the WebApp read and write. Toggling this switches the
   # provider the deployed apps use; it does NOT migrate anything, so message history, audit
   # trail and metrics written to the other store stay there and stop being visible.
@@ -89,7 +103,7 @@ parameters:
   # The WebApp needs a sign-in, and the bicep creates no Entra app registration: if you use
   # Entra, AzureAd__ClientId and friends are configured by hand on the WebApp and every
   # deployment carries them forward — which also means a torn-down environment comes back
-  # without them, throwing IDW10106 on every request, /alive included.
+  # without them, and a WebApp with no sign-in configured refuses to start.
   #
   # Setting this instead seeds ASP.NET Core Identity: a username/password admin created on
   # first boot, described entirely by this pipeline and therefore reproducible after a
@@ -120,7 +134,7 @@ parameters:
   - name: nimbusVersion
     displayName: "Akaule.NimBus.CommandLine version to install and deploy"
     type: string
-    default: 3.4.0
+    default: 4.8.0
   # REPLACE: your catalog, published by the platform repo (../platform in this template).
   # It decides the Service Bus topology and what the management UI renders, so the version is
   # pinned rather than floated — a merge in the platform repo must not reroute a running
@@ -145,8 +159,102 @@ parameters:
     type: string
     default: https://pkgs.dev.azure.com/acme/00000000-0000-0000-0000-000000000000/_packaging/acme-platform/nuget
 
+  # ---------- Private networking (opt-in; NimBus docs/private-networking.md) ----------
+  #
+  # 'private' puts Service Bus, the store, the Functions storage and both apps behind private
+  # endpoints in subnets you provide, and turns public access off. Service Bus must be
+  # Premium for that, and the run must come from an agent inside the network: topology
+  # provisioning, the app deploys and the verify step all talk to private endpoints.
+  #
+  # nb records the network setup as tags on the resource group, so only the first private run
+  # needs the subnets and DNS settings; later runs reproduce the record. 'auto' below means
+  # "pass nothing": the recorded setting, else the CLI's default (public).
+  - name: agentPool
+    displayName: "Agent pool ('Azure Pipelines' = Microsoft-hosted; private mode needs a pool inside the network)"
+    type: string
+    default: Azure Pipelines
+  - name: networkMode
+    displayName: "Network mode ('auto' = the recorded mode, else public)"
+    type: string
+    default: auto
+    values:
+      - auto
+      - public
+      - private
+  # Moving an existing public deployment takes two runs: one with this ticked, which adds the
+  # private endpoints, DNS and VNet integration while public access stays on, then one
+  # without, which locks it. Per run, never recorded.
+  - name: allowPublicAccess
+    displayName: "Private mode: transition pass that keeps public access on (pass 1 of moving an existing deployment)"
+    type: boolean
+    default: false
+  - name: skipTransition
+    displayName: "Private mode: switch an existing deployment straight to private, accepting downtime"
+    type: boolean
+    default: false
+  - name: privateEndpointSubnetId
+    displayName: "Subnet id the private endpoints take their addresses from (not delegated)"
+    type: string
+    default: auto
+  - name: resolverSubnetId
+    displayName: "Subnet id for the Resolver's VNet integration (Flex: Microsoft.App/environments; EP: Microsoft.Web/serverFarms)"
+    type: string
+    default: auto
+  - name: webAppSubnetId
+    displayName: "Subnet id for the WebApp's VNet integration (delegated to Microsoft.Web/serverFarms)"
+    type: string
+    default: auto
+  # 'create' only for a VNet dedicated to NimBus: a linked zone answers for every name of its
+  # type in that VNet, so it would take over resolution for other workloads sharing it.
+  - name: privateDns
+    displayName: "Who owns the privatelink DNS zones: NimBus (create), a hub resource group (existing), or your DNS (external)"
+    type: string
+    default: auto
+    values:
+      - auto
+      - create
+      - existing
+      - external
+  - name: privateDnsZoneScope
+    displayName: "privateDns 'existing': resource group id holding the privatelink zones"
+    type: string
+    default: auto
+  - name: monitorPrivateLink
+    displayName: "How telemetry reaches Azure Monitor in private mode ('none' = through your firewall)"
+    type: string
+    default: auto
+    values:
+      - auto
+      - none
+  - name: serviceBusCapacity
+    displayName: "Service Bus Premium messaging units ('auto' = existing, else 1)"
+    type: string
+    default: auto
+    values:
+      - auto
+      - "1"
+      - "2"
+      - "4"
+      - "8"
+      - "16"
+  # Azure cannot convert a Standard namespace to Premium in place, so moving an existing
+  # deployment to private means a new Premium namespace under a new name. nb records it, and
+  # later runs and the verify step follow the record.
+  - name: serviceBusNamespaceName
+    displayName: "Service Bus namespace name ('auto' = the recorded one, else sb-<solutionId>-<environment>)"
+    type: string
+    default: auto
+  - name: dnsWait
+    displayName: "Minutes nb waits for the private endpoints to resolve from the agent ('auto' = 10)"
+    type: string
+    default: auto
+
+# Microsoft-hosted unless agentPool names a pool of your own, which private mode requires:
+# a hosted agent cannot resolve or reach the private endpoints.
 pool:
-  vmImage: ubuntu-latest
+  name: ${{ parameters.agentPool }}
+  ${{ if eq(parameters.agentPool, 'Azure Pipelines') }}:
+    vmImage: ubuntu-latest
 
 steps:
   # The checkout is only here for this file. Nothing in the repository is read by the
@@ -178,6 +286,21 @@ steps:
       NB_SQL_ADMIN_LOGIN: ${{ parameters.sqlAdminLogin }}
       NB_SQL_SERVER_NAME: ${{ parameters.sqlServerName }}
       NB_IDENTITY_ADMIN_EMAIL: ${{ parameters.identityAdminEmail }}
+      NB_RESOLVER_MAX_SESSIONS: ${{ parameters.resolverMaxSessions }}
+      NB_RESOLVER_MAX_INSTANCES: ${{ parameters.resolverMaxInstances }}
+      NB_AGENT_POOL: ${{ parameters.agentPool }}
+      NB_NETWORK_MODE: ${{ parameters.networkMode }}
+      NB_ALLOW_PUBLIC_ACCESS: ${{ parameters.allowPublicAccess }}
+      NB_SKIP_TRANSITION: ${{ parameters.skipTransition }}
+      NB_PRIVATE_ENDPOINT_SUBNET_ID: ${{ parameters.privateEndpointSubnetId }}
+      NB_RESOLVER_SUBNET_ID: ${{ parameters.resolverSubnetId }}
+      NB_WEBAPP_SUBNET_ID: ${{ parameters.webAppSubnetId }}
+      NB_PRIVATE_DNS: ${{ parameters.privateDns }}
+      NB_PRIVATE_DNS_ZONE_SCOPE: ${{ parameters.privateDnsZoneScope }}
+      NB_MONITOR_PRIVATE_LINK: ${{ parameters.monitorPrivateLink }}
+      NB_SERVICE_BUS_CAPACITY: ${{ parameters.serviceBusCapacity }}
+      NB_SERVICE_BUS_NAMESPACE_NAME: ${{ parameters.serviceBusNamespaceName }}
+      NB_DNS_WAIT: ${{ parameters.dnsWait }}
       # The feed is private, so the CLI needs a credential to read it. It goes out as the
       # password half of Basic auth over HTTPS; the build service identity needs read access
       # to the feed for this to resolve.
@@ -236,9 +359,9 @@ steps:
           fi
         fi
 
-        # Sign-in. Without one of the two paths the WebApp throws IDW10106 on every request
-        # and even /alive returns 500, so this fails the run before deploying rather than
-        # leaving an environment nobody can log into.
+        # Sign-in. Without one of the two paths the WebApp refuses to start, so /alive never
+        # answers; this fails the run before deploying rather than leaving an environment
+        # nobody can log into.
         if [ -n "$NB_IDENTITY_ADMIN_EMAIL" ] && [ "$NB_IDENTITY_ADMIN_EMAIL" != "none" ]; then
           if [ "$NB_STORAGE_PROVIDER" != "sqlserver" ]; then
             echo "##vso[task.logissue type=error]identityAdminEmail requires storageProvider 'sqlserver' — the accounts live in the same database. Clear it and configure AzureAd__* on the WebApp instead."
@@ -252,6 +375,42 @@ steps:
           esac
           EXTRA_ARGS+=(--identity-admin-email "$NB_IDENTITY_ADMIN_EMAIL")
         fi
+
+        # nb parses these numbers itself, but only after `az group create` below has run.
+        for SETTING in "resolverMaxSessions=$NB_RESOLVER_MAX_SESSIONS" "resolverMaxInstances=$NB_RESOLVER_MAX_INSTANCES" "dnsWait=$NB_DNS_WAIT"; do
+          case "${SETTING#*=}" in
+            auto|'') ;;
+            *[!0-9]*)
+              echo "##vso[task.logissue type=error]${SETTING%%=*} must be a whole number or 'auto', not '${SETTING#*=}'."
+              exit 1
+              ;;
+          esac
+        done
+
+        # A hosted agent cannot resolve the private endpoints, so nb's pre-flight check would
+        # stop the run only after infra had already locked the data services.
+        if [ "$NB_NETWORK_MODE" = "private" ] && [ "$NB_AGENT_POOL" = "Azure Pipelines" ]; then
+          echo "##vso[task.logissue type=error]networkMode 'private' needs agentPool set to a pool inside the network; a Microsoft-hosted agent cannot reach the private endpoints."
+          exit 1
+        fi
+
+        # 'auto' (or empty) passes nothing, so nb keeps the setting recorded on the resource
+        # group by an earlier run, or falls back to its own default.
+        add_option() { if [ -n "$2" ] && [ "$2" != "auto" ]; then EXTRA_ARGS+=("$1" "$2"); fi; }
+        add_option --resolver-max-sessions "$NB_RESOLVER_MAX_SESSIONS"
+        add_option --resolver-max-instances "$NB_RESOLVER_MAX_INSTANCES"
+        add_option --network-mode "$NB_NETWORK_MODE"
+        add_option --private-endpoint-subnet-id "$NB_PRIVATE_ENDPOINT_SUBNET_ID"
+        add_option --resolver-subnet-id "$NB_RESOLVER_SUBNET_ID"
+        add_option --webapp-subnet-id "$NB_WEBAPP_SUBNET_ID"
+        add_option --private-dns "$NB_PRIVATE_DNS"
+        add_option --private-dns-zone-scope "$NB_PRIVATE_DNS_ZONE_SCOPE"
+        add_option --monitor-private-link "$NB_MONITOR_PRIVATE_LINK"
+        add_option --service-bus-capacity "$NB_SERVICE_BUS_CAPACITY"
+        add_option --service-bus-namespace-name "$NB_SERVICE_BUS_NAMESPACE_NAME"
+        add_option --dns-wait "$NB_DNS_WAIT"
+        if [ "$NB_ALLOW_PUBLIC_ACCESS" = "True" ]; then EXTRA_ARGS+=(--allow-public-access); fi
+        if [ "$NB_SKIP_TRANSITION" = "True" ]; then EXTRA_ARGS+=(--skip-transition); fi
 
         az account set --subscription "${{ parameters.subscriptionId }}"
         az group create --name "${{ parameters.resourceGroup }}" --location "${{ parameters.location }}" --output none
@@ -380,10 +539,19 @@ steps:
           --platform-package "${{ parameters.platformPackage }}" \
           --platform-feed "${{ parameters.platformFeed }}" \
           --output "$CATALOG"
+        # The namespace nb provisioned into: the override, else the one recorded on the
+        # resource group (a Premium namespace created to move to private mode), else the
+        # conventional name.
+        NAMESPACE="${{ parameters.serviceBusNamespaceName }}"
+        if [ "$NAMESPACE" = "auto" ]; then
+          NAMESPACE=$(az group show --name "${{ parameters.resourceGroup }}" \
+            --query 'tags."nimbus-service-bus-namespace"' --output tsv)
+        fi
+        if [ -z "$NAMESPACE" ]; then NAMESPACE="sb-${{ parameters.solutionId }}-${{ parameters.environment }}"; fi
         TOPICS=$(mktemp)
         az servicebus topic list \
           --resource-group "${{ parameters.resourceGroup }}" \
-          --namespace-name "sb-${{ parameters.solutionId }}-${{ parameters.environment }}" \
+          --namespace-name "$NAMESPACE" \
           --query "[].name" --output tsv > "$TOPICS"
         MISSING=""
         for ENDPOINT in $(grep -o '"id": *"[^"]*Endpoint"' "$CATALOG" | grep -o '[A-Za-z0-9]*Endpoint' | sort -u); do

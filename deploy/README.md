@@ -55,9 +55,13 @@ principal is an Azure RBAC identity rather than a WebApp user — it gets
 
 1. Replace every parameter marked `REPLACE` in the pipeline.
 2. Create the Azure service connection named in `azureServiceConnection`.
-3. Register the required resource providers on the subscription: `Microsoft.ServiceBus`,
-   `Microsoft.Web`, `Microsoft.Storage`, `Microsoft.Insights`, `Microsoft.DocumentDB`,
-   `Microsoft.EventGrid`.
+3. Register the resource providers on the subscription:
+   - always: `Microsoft.ServiceBus`, `Microsoft.Web`, `Microsoft.Storage`, `Microsoft.Insights`
+   - the store: `Microsoft.Sql` for `storageProvider: sqlserver` + `sqlMode: provision` (the
+     default), or `Microsoft.DocumentDB` for `cosmos`
+   - `networkMode: private`: `Microsoft.Network`, plus `Microsoft.App` on Flex Consumption
+   - `Microsoft.EventGrid` only if you use Event Grid storage hooks; `nb` tries to register it
+     itself and only warns if it can't
 4. Grant the identity your pipelines run as **read** access to the platform feed.
 5. Define the **secret** pipeline variables the chosen store needs — the run fails before it
    touches Azure if one is missing:
@@ -70,6 +74,54 @@ principal is an Azure RBAC identity rather than a WebApp user — it gets
 To do a first run before your catalog exists, set `platformPackage` to an empty string — that
 deploys NimBus's built-in demo catalog, which is a good way to separate "does my Azure setup
 work" from "does my catalog work".
+
+## Private networking
+
+`networkMode: private` puts Service Bus, the store, the Functions storage and both apps behind
+private endpoints in your subnets and turns public access off. It is opt-in; the defaults
+deploy publicly, as before. NimBus's
+[private-networking.md](https://github.com/context-and-oss/NimBus/blob/master/docs/private-networking.md)
+is the full guide. What the pipeline needs from you:
+
+- **An agent inside the network.** Set `agentPool` to a self-hosted pool or a Managed DevOps
+  Pool in (or peered to) the VNet. It must resolve the privatelink zones and have the Azure
+  CLI, plus egress to Azure Resource Manager, Entra ID, Azure DevOps and nuget.org. The run
+  refuses `private` on the Microsoft-hosted pool.
+- **Three subnets** — `privateEndpointSubnetId` (not delegated), `resolverSubnetId` and
+  `webAppSubnetId` (delegated as the parameter descriptions say) — and a DNS choice in
+  `privateDns`, plus `monitorPrivateLink: none`. The service connection's identity needs
+  Network Contributor on the subnets, and Private DNS Zone Contributor on the zones'
+  resource group for `privateDns: existing`.
+- **Egress from the apps to Entra ID** through your firewall, before the first private run:
+  both apps route all outbound traffic into the VNet, managed-identity token requests
+  included.
+
+`nb` records the network setup on the resource group, so only the first private run needs the
+subnets and DNS settings; leave the rest on `auto` afterwards.
+
+A **new** environment needs one run. An **existing** public one moves in steps:
+
+1. Service Bus must be Premium, and Azure can't convert a Standard namespace in place, so the
+   move lands on a new namespace and does not copy messages. Quiesce publishers and let the
+   Resolver and subscribers drain first.
+2. Run with `networkMode: private`, the network settings, `allowPublicAccess` ticked and a
+   new `serviceBusNamespaceName` (e.g. `sb-acme-prod-premium`). This adds the Premium
+   namespace, private endpoints, DNS and VNet integration while public access stays on;
+   `nb` and the verify step follow the recorded namespace name from then on. Re-point your
+   adapters at the new namespace and check the NimBus names resolve to private addresses
+   from the apps and from your adapters' networks.
+3. Run again with `networkMode: private` and `allowPublicAccess` unticked to turn public
+   access off. Choose `private` explicitly: on `auto`, `nb` reproduces the recorded,
+   unfinished transition.
+
+`networkMode: public` rolls back, deleting only the network resources `nb` created.
+
+## Resolver capacity
+
+`resolverMaxSessions` (default 16 per instance) and `resolverMaxInstances` bound how hard the
+Resolver drives the message store. Raise them only together with the store's throughput:
+200 sessions per instance throttled the store in production, which is why NimBus moved the
+default to 16.
 
 ## Upgrading NimBus
 

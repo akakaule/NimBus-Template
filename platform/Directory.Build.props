@@ -17,7 +17,7 @@
     <!-- The `nb` CLI reflection-loads this assembly to read the catalog, so it must be built
          against the NimBus version the deployment runs. Kept in one place because the deploy
          pipeline pins the same number for the CLI itself. -->
-    <NimBusVersion>3.4.0</NimBusVersion>
+    <NimBusVersion>4.8.0</NimBusVersion>
   </PropertyGroup>
 
   <!-- REPLACE: your organisation and the repository this ends up in. The URLs are metadata
