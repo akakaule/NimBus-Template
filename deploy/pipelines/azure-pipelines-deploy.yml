@@ -134,7 +134,7 @@ parameters:
   - name: nimbusVersion
     displayName: "Akaule.NimBus.CommandLine version to install and deploy"
     type: string
-    default: 4.8.0
+    default: 5.6.0
   # REPLACE: your catalog, published by the platform repo (../platform in this template).
   # It decides the Service Bus topology and what the management UI renders, so the version is
   # pinned rather than floated — a merge in the platform repo must not reroute a running
@@ -158,6 +158,46 @@ parameters:
     displayName: "Feed serving the platform package (no /v3/index.json)"
     type: string
     default: https://pkgs.dev.azure.com/acme/00000000-0000-0000-0000-000000000000/_packaging/acme-platform/nuget
+
+  # ---------- Alerts (opt-in; NimBus docs/notifications.md) ----------
+  #
+  # Alert mail is on only with both a host and a sender. nb does not record these settings: it
+  # replaces the apps' alert settings on every run, so a run with 'none' turns alert mail off.
+  - name: alertMailSmtpHost
+    displayName: "SMTP server for alert mail, e.g. smtp.azurecomm.net ('none' = alert mail off)"
+    type: string
+    default: none
+  - name: alertMailFrom
+    displayName: "Sender address of alert mail (needed with alertMailSmtpHost)"
+    type: string
+    default: none
+  # With a user name, the password comes from the secret variable NIMBUS_ALERT_MAIL_SMTP_PASSWORD.
+  - name: alertMailSmtpUsername
+    displayName: "SMTP user name ('none' = no SMTP sign-in)"
+    type: string
+    default: none
+  # Alert webhooks are signed with the secret variable NIMBUS_ALERT_WEBHOOK_SIGNING_KEY (at least
+  # 32 characters). A boolean rather than "is the variable defined": an undefined variable reaches
+  # the script as the literal '$(NIMBUS_ALERT_WEBHOOK_SIGNING_KEY)', which is long enough to pass
+  # for a key.
+  - name: alertWebhooks
+    displayName: "Deliver alerts to webhooks (needs the secret NIMBUS_ALERT_WEBHOOK_SIGNING_KEY)"
+    type: boolean
+    default: false
+
+  # ---------- Legacy resource names (only for environments the old pipeline scripts created) ----------
+  #
+  # A postfix is appended to the Service Bus namespace, Cosmos DB account, SQL server, Resolver and
+  # WebApp names. nb records it on the resource group and refuses a run whose postfix differs from
+  # the recorded one, so it cannot create a second set of resources by accident.
+  - name: resourceNamePostfix
+    displayName: "Resource-name postfix of a legacy environment, letters and digits ('none' = the recorded one, else no postfix)"
+    type: string
+    default: none
+  - name: funcStorageAccountName
+    displayName: "Existing storage account for the Resolver ('auto' = the recorded one, else st<solutionId><environment>func)"
+    type: string
+    default: auto
 
   # ---------- Private networking (opt-in; NimBus docs/private-networking.md) ----------
   #
@@ -301,6 +341,17 @@ steps:
       NB_SERVICE_BUS_CAPACITY: ${{ parameters.serviceBusCapacity }}
       NB_SERVICE_BUS_NAMESPACE_NAME: ${{ parameters.serviceBusNamespaceName }}
       NB_DNS_WAIT: ${{ parameters.dnsWait }}
+      NB_RESOURCE_NAME_POSTFIX: ${{ parameters.resourceNamePostfix }}
+      NB_FUNC_STORAGE_ACCOUNT_NAME: ${{ parameters.funcStorageAccountName }}
+      NB_ALERT_MAIL_SMTP_HOST: ${{ parameters.alertMailSmtpHost }}
+      NB_ALERT_MAIL_FROM: ${{ parameters.alertMailFrom }}
+      NB_ALERT_MAIL_SMTP_USERNAME: ${{ parameters.alertMailSmtpUsername }}
+      NB_ALERT_WEBHOOKS: ${{ parameters.alertWebhooks }}
+      # Mapped only when asked for, so an unset secret never reaches nb as the literal '$(NAME)'.
+      ${{ if ne(parameters.alertMailSmtpUsername, 'none') }}:
+        NIMBUS_ALERT_MAIL_SMTP_PASSWORD: $(NIMBUS_ALERT_MAIL_SMTP_PASSWORD)
+      ${{ if eq(parameters.alertWebhooks, true) }}:
+        NIMBUS_ALERT_WEBHOOK_SIGNING_KEY: $(NIMBUS_ALERT_WEBHOOK_SIGNING_KEY)
       # The feed is private, so the CLI needs a credential to read it. It goes out as the
       # password half of Basic auth over HTTPS; the build service identity needs read access
       # to the feed for this to resolve.
@@ -376,6 +427,42 @@ steps:
           EXTRA_ARGS+=(--identity-admin-email "$NB_IDENTITY_ADMIN_EMAIL")
         fi
 
+        # Alerts. nb replaces the apps' alert settings on every run, so what is not passed here
+        # is switched off.
+        if [ -n "$NB_ALERT_MAIL_SMTP_HOST" ] && [ "$NB_ALERT_MAIL_SMTP_HOST" != "none" ]; then
+          if [ -z "$NB_ALERT_MAIL_FROM" ] || [ "$NB_ALERT_MAIL_FROM" = "none" ]; then
+            echo "##vso[task.logissue type=error]alertMailSmtpHost needs alertMailFrom: alert mail is on only with both."
+            exit 1
+          fi
+          EXTRA_ARGS+=(--alert-mail-smtp-host "$NB_ALERT_MAIL_SMTP_HOST" --alert-mail-from "$NB_ALERT_MAIL_FROM")
+          if [ -n "$NB_ALERT_MAIL_SMTP_USERNAME" ] && [ "$NB_ALERT_MAIL_SMTP_USERNAME" != "none" ]; then
+            case "${NIMBUS_ALERT_MAIL_SMTP_PASSWORD:-}" in
+              ''|'$('*)
+                echo "##vso[task.logissue type=error]Define a secret pipeline variable NIMBUS_ALERT_MAIL_SMTP_PASSWORD for alertMailSmtpUsername, or set it to 'none'."
+                exit 1
+                ;;
+            esac
+            EXTRA_ARGS+=(--alert-mail-smtp-username "$NB_ALERT_MAIL_SMTP_USERNAME")
+          fi
+        fi
+        if [ "$NB_ALERT_WEBHOOKS" = "True" ]; then
+          case "${NIMBUS_ALERT_WEBHOOK_SIGNING_KEY:-}" in
+            ''|'$('*)
+              echo "##vso[task.logissue type=error]Define a secret pipeline variable NIMBUS_ALERT_WEBHOOK_SIGNING_KEY (at least 32 characters) to deliver alerts to webhooks, or untick alertWebhooks."
+              exit 1
+              ;;
+          esac
+          if [ "${#NIMBUS_ALERT_WEBHOOK_SIGNING_KEY}" -lt 32 ]; then
+            echo "##vso[task.logissue type=error]NIMBUS_ALERT_WEBHOOK_SIGNING_KEY must be at least 32 characters; nb ignores a shorter key and leaves webhooks off."
+            exit 1
+          fi
+        fi
+
+        # Legacy resource names. 'none' passes nothing, so nb keeps the postfix it recorded.
+        if [ -n "$NB_RESOURCE_NAME_POSTFIX" ] && [ "$NB_RESOURCE_NAME_POSTFIX" != "none" ]; then
+          EXTRA_ARGS+=(--resource-name-postfix "$NB_RESOURCE_NAME_POSTFIX")
+        fi
+
         # nb parses these numbers itself, but only after `az group create` below has run.
         for SETTING in "resolverMaxSessions=$NB_RESOLVER_MAX_SESSIONS" "resolverMaxInstances=$NB_RESOLVER_MAX_INSTANCES" "dnsWait=$NB_DNS_WAIT"; do
           case "${SETTING#*=}" in
@@ -409,6 +496,7 @@ steps:
         add_option --service-bus-capacity "$NB_SERVICE_BUS_CAPACITY"
         add_option --service-bus-namespace-name "$NB_SERVICE_BUS_NAMESPACE_NAME"
         add_option --dns-wait "$NB_DNS_WAIT"
+        add_option --func-storage-account-name "$NB_FUNC_STORAGE_ACCOUNT_NAME"
         if [ "$NB_ALLOW_PUBLIC_ACCESS" = "True" ]; then EXTRA_ARGS+=(--allow-public-access); fi
         if [ "$NB_SKIP_TRANSITION" = "True" ]; then EXTRA_ARGS+=(--skip-transition); fi
 
@@ -448,7 +536,17 @@ steps:
       inlineScript: |
         set -euo pipefail
         az account set --subscription "${{ parameters.subscriptionId }}"
-        APP="webapp-${{ parameters.solutionId }}-${{ parameters.environment }}-management"
+        # A legacy environment's names carry a postfix: the parameter, else the one nb recorded
+        # on the resource group. nb normalises it the same way (no leading '-', lower case).
+        POSTFIX="${{ parameters.resourceNamePostfix }}"
+        if [ "$POSTFIX" = "none" ] || [ -z "$POSTFIX" ]; then
+          POSTFIX=$(az group show --name "${{ parameters.resourceGroup }}" \
+            --query 'tags."nimbus-resource-name-postfix"' --output tsv)
+        fi
+        POSTFIX=$(echo "${POSTFIX#-}" | tr '[:upper:]' '[:lower:]')
+        SUFFIX=""
+        if [ -n "$POSTFIX" ]; then SUFFIX="-${POSTFIX}"; fi
+        APP="webapp-${{ parameters.solutionId }}-${{ parameters.environment }}-management${SUFFIX}"
         HOST=$(az webapp show \
           --resource-group "${{ parameters.resourceGroup }}" \
           --name "$APP" \
@@ -547,7 +645,7 @@ steps:
           NAMESPACE=$(az group show --name "${{ parameters.resourceGroup }}" \
             --query 'tags."nimbus-service-bus-namespace"' --output tsv)
         fi
-        if [ -z "$NAMESPACE" ]; then NAMESPACE="sb-${{ parameters.solutionId }}-${{ parameters.environment }}"; fi
+        if [ -z "$NAMESPACE" ]; then NAMESPACE="sb-${{ parameters.solutionId }}-${{ parameters.environment }}${SUFFIX}"; fi
         TOPICS=$(mktemp)
         az servicebus topic list \
           --resource-group "${{ parameters.resourceGroup }}" \

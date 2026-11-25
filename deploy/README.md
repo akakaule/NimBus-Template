@@ -28,7 +28,7 @@ Application Insights, an App Service plan with the management WebApp, and a Func
 the Resolver — plus **role assignments**, which is why the service connection's identity needs
 Owner, or Contributor plus Role Based Access Control Administrator. The full inventory,
 provider registrations and RBAC matrix are in NimBus's
-[azure-requirements.md](https://github.com/akakaule/NimBus/blob/master/docs/azure-requirements.md).
+[azure-requirements.md](https://github.com/context-and-oss/NimBus/blob/master/docs/azure-requirements.md).
 Read it before the first run: this creates billable resources.
 
 ## What the verify step asserts
@@ -123,6 +123,34 @@ Resolver drives the message store. Raise them only together with the store's thr
 200 sessions per instance throttled the store in production, which is why NimBus moved the
 default to 16.
 
+## Alerts
+
+Both are off by default, and `nb` does **not** record them on the resource group: it replaces
+the apps' alert settings on every run, so leave the parameters set for as long as you want the
+alerts.
+
+- **Mail.** Set `alertMailSmtpHost` and `alertMailFrom` (alert mail is on only with both). The
+  Resolver mails the subscribers of an endpoint's alerts, and the WebApp mails the targets of
+  alert rules. For an SMTP sign-in, set `alertMailSmtpUsername` and define the secret variable
+  `NIMBUS_ALERT_MAIL_SMTP_PASSWORD`.
+- **Webhooks.** Tick `alertWebhooks` and define the secret variable
+  `NIMBUS_ALERT_WEBHOOK_SIGNING_KEY` (at least 32 characters). `nb` ignores a shorter key and
+  leaves webhooks off, so the run fails first instead.
+
+NimBus's [notifications.md](https://github.com/context-and-oss/NimBus/blob/master/docs/notifications.md)
+describes what gets sent.
+
+## Legacy resource names
+
+Only for an environment that NimBus's old pipeline scripts created, whose resource names end in
+a postfix. Set `resourceNamePostfix` to that postfix on the first run. `nb` appends it to the
+Service Bus namespace, Cosmos DB account, SQL server, Resolver and WebApp names, records it on
+the resource group, and refuses a run whose postfix differs from the recorded one, so it cannot
+deploy a second set of resources next to the first. `funcStorageAccountName` points the
+Resolver at the existing storage account of such an environment. The verify step follows the
+postfix. A new environment leaves both parameters alone. See
+[Legacy resource names](https://github.com/context-and-oss/NimBus/blob/master/docs/cli.md#legacy-resource-names).
+
 ## Upgrading NimBus
 
 Bump `nimbusVersion`. The CLI version selects the deployment artifacts, so an upgrade is a
@@ -130,3 +158,19 @@ reviewed change to this file and never something a release on nuget.org does to 
 environment on its own. Keep `NimBusVersion` in the platform repo's `Directory.Build.props` on
 the same number — the CLI reflection-loads your catalog assembly, so the two must be
 compatible.
+
+Read the [release notes](https://github.com/context-and-oss/NimBus/releases) of every version
+between yours and the target, and upgrade in NimBus's order: publish the catalog built against
+the new version first, then move both pins here and deploy dev before test and prod.
+
+From 4.8 to 5.6, three things are worth knowing:
+
+- **The run re-applies the topology**, which 4.10 and 4.11 changed (deferred subscriptions no
+  longer expire messages; forwarders pass only original publishes). `nb setup` does this as
+  part of every run, so there is no extra step.
+- **5.0 removed the built-in failure-intelligence provider.** Its app settings
+  (`FailureClassification:Provider`, `FailureClassification:TypeSafe:*` and the flat `ApiKey`,
+  `BaseUrl`, `Model`, `TimeoutSeconds`) are ignored and logged once by name. Remove them, and
+  the provider's API key, if you set them by hand.
+- **`sqlMode: external`** needs 4.19 or later: before that the Resolver's SQL connection was
+  not configured for an external server.
