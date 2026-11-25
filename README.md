@@ -1,6 +1,6 @@
 # NimBus template — Azure DevOps
 
-A starting point for running [NimBus](https://github.com/akakaule/NimBus) in your own Azure
+A starting point for running [NimBus](https://github.com/context-and-oss/NimBus) in your own Azure
 subscription, deployed from Azure DevOps, with your integration contracts owned by your own
 team and published to your own private Azure Artifacts feed.
 
@@ -103,7 +103,7 @@ catalog's endpoints have topics in the namespace.
 
 ## Versions
 
-This template is pinned to **NimBus 4.8.0**, in three places that must move together:
+This template is pinned to **NimBus 5.6.0**, in three places that must move together:
 
 - `deploy/pipelines/azure-pipelines-deploy.yml` → `nimbusVersion`
 - `platform/Directory.Build.props` → `NimBusVersion` (the `Akaule.NimBus.Abstractions` your
@@ -114,13 +114,13 @@ This template is pinned to **NimBus 4.8.0**, in three places that must move toge
 
 Not a runtime. Your adapters — the services that publish and handle events — are your own
 applications; this template deploys the platform they talk to and the catalog that describes
-them. See NimBus's [getting-started](https://github.com/akakaule/NimBus/blob/master/docs/getting-started.md)
-and [sdk-api-reference](https://github.com/akakaule/NimBus/blob/master/docs/sdk-api-reference.md)
+them. See NimBus's [getting-started](https://github.com/context-and-oss/NimBus/blob/master/docs/getting-started.md)
+and [sdk-api-reference](https://github.com/context-and-oss/NimBus/blob/master/docs/sdk-api-reference.md)
 for writing those.
 
 Not the only way to deploy NimBus either — `nb setup` runs perfectly well from a laptop or a
 GitHub Actions workflow. See
-[deployment.md](https://github.com/akakaule/NimBus/blob/master/docs/deployment.md).
+[deployment.md](https://github.com/context-and-oss/NimBus/blob/master/docs/deployment.md).
 
 ## License
 

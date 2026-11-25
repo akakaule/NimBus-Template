@@ -59,7 +59,7 @@ To see what NimBus will make of a change before publishing anything, point the C
 build output — this is the same reflection load the deployment performs:
 
 ```bash
-dotnet tool install --global Akaule.NimBus.CommandLine --version 4.8.0
+dotnet tool install --global Akaule.NimBus.CommandLine --version 5.6.0
 
 # The topology NimBus would provision
 nb topology export --assembly src/Acme.Platform/bin/Release/net10.0/Acme.Platform.dll \
